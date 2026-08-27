@@ -1,0 +1,188 @@
+"use client";
+
+import { useCallback, useRef } from "react";
+import { useAppStore } from "@/stores/app-store";
+import { SentenceSplitter } from "@/lib/sentence-splitter";
+import { useTTS } from "@/hooks/useTTS";
+import {
+  enqueueAudio,
+  clearAudioQueue,
+  primeAudioPlayback,
+} from "@/hooks/useLipSync";
+import type { ChatMessage } from "@/types";
+
+function isPipelineDebugEnabled(): boolean {
+  if (process.env.NEXT_PUBLIC_TTS_DEBUG === "1") return true;
+  if (process.env.NEXT_PUBLIC_TTS_DEBUG === "0") return false;
+  return process.env.NODE_ENV !== "production";
+}
+
+function previewText(text: string, max = 80): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, max)}…`;
+}
+
+function makeId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export function useChat() {
+  const { initialize: initTTS, synthesize } = useTTS();
+  const abortRef = useRef<AbortController | null>(null);
+  const generationIdRef = useRef(0);
+
+  const addMessage = useAppStore((s) => s.addMessage);
+  const updateLastAssistantMessage = useAppStore((s) => s.updateLastAssistantMessage);
+  const setPipelineStatus = useAppStore((s) => s.setPipelineStatus);
+  const setError = useAppStore((s) => s.setError);
+  const ttsReady = useAppStore((s) => s.ttsReady);
+  const currentProvider = useAppStore((s) => s.currentProvider);
+
+  const sendMessage = useCallback(
+    async (text: string) => {
+      await primeAudioPlayback();
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+
+      // Ensure TTS is initialized (first user interaction)
+      if (!ttsReady) {
+        await initTTS();
+      }
+
+      // Abort any in-flight request and invalidate stale TTS callbacks
+      abortRef.current?.abort();
+      clearAudioQueue();
+      abortRef.current = new AbortController();
+      const currentGeneration = ++generationIdRef.current;
+
+      const userMessage: ChatMessage = {
+        id: makeId(),
+        role: "user",
+        content: text,
+        timestamp: Date.now(),
+      };
+      addMessage(userMessage);
+
+      const assistantMessage: ChatMessage = {
+        id: makeId(),
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+      };
+      addMessage(assistantMessage);
+
+      setPipelineStatus("thinking");
+
+      // Prepare messages for API (only role + content)
+      const allMessages = useAppStore.getState().messages;
+      const apiMessages = allMessages
+        .filter((m) => m.content.length > 0)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: apiMessages, provider: currentProvider }),
+          signal: abortRef.current.signal,
+        });
+
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || `HTTP ${res.status}`);
+        }
+
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("No response body");
+
+        const decoder = new TextDecoder();
+        let fullContent = "";
+        let startedSpeaking = false;
+        let enqueuedAudio = false;
+        let ttsChain = Promise.resolve();
+        let sentenceIndex = 0;
+
+        const splitter = new SentenceSplitter(async (sentence) => {
+          const segmentId = sentenceIndex++;
+          if (isPipelineDebugEnabled()) {
+            console.debug("[Chat pipeline] sentence queued for TTS", {
+              segmentId,
+              length: sentence.length,
+              preview: previewText(sentence),
+            });
+          }
+
+          // Start synthesis immediately (parallel) — don't wait for previous sentences
+          const segmentPromise = synthesize(sentence);
+
+          // But enqueue audio in order so playback is sequential
+          ttsChain = ttsChain.then(async () => {
+            // Discard results if a newer message has taken over
+            if (generationIdRef.current !== currentGeneration) return;
+            const segmentStart = performance.now();
+            if (!startedSpeaking) {
+              setPipelineStatus("speaking");
+              startedSpeaking = true;
+            }
+            const segment = await segmentPromise;
+            if (generationIdRef.current !== currentGeneration) return;
+            if (segment) {
+              enqueuedAudio = true;
+              await enqueueAudio(segment);
+            }
+            if (isPipelineDebugEnabled()) {
+              console.debug("[Chat pipeline] sentence TTS completed", {
+                segmentId,
+                enqueuedAudio: segment !== null,
+                elapsedMs: Math.round(performance.now() - segmentStart),
+                preview: previewText(sentence),
+              });
+            }
+          });
+        });
+
+        // Read the plain text stream from toTextStreamResponse()
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const text = decoder.decode(value, { stream: true });
+          if (text) {
+            fullContent += text;
+            updateLastAssistantMessage(fullContent);
+            splitter.add(text);
+          }
+        }
+
+        // Flush remaining text
+        splitter.finish();
+        await ttsChain;
+
+        // If no audio was enqueued (all TTS failed, or browser fallback used),
+        // reset to idle — AudioQueue.onFinished won't fire in this case.
+        if (!enqueuedAudio) {
+          setPipelineStatus("idle");
+        }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        console.error("Chat error:", err);
+        setError((err as Error).message);
+        setPipelineStatus("idle");
+      }
+    },
+    [addMessage, updateLastAssistantMessage, setPipelineStatus, setError, ttsReady, initTTS, synthesize, currentProvider]
+  );
+
+  const stopGeneration = useCallback(() => {
+    abortRef.current?.abort();
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    clearAudioQueue();
+    setPipelineStatus("idle");
+  }, [setPipelineStatus]);
+
+  return { sendMessage, stopGeneration };
+}
